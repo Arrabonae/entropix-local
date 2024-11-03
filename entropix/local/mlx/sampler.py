@@ -80,9 +80,7 @@ def adaptive_sample(logits: mx.array, temperature: float, epsilon: float = 0.01,
         varentropy_reduction = cumulative_varentropy - current_varentropy
 
         # Update mask where entropy reduction is sufficient
-        candidate_mask = candidate_mask.at[..., i].set(
-            (entropy_reduction >= epsilon).astype(mx.float32)
-        )
+        candidate_mask[:, i] = entropy_reduction >= epsilon
 
         # Update cumulative values
         cumulative_entropy = mx.where(entropy_reduction >= epsilon,
@@ -283,4 +281,58 @@ def sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.array, c
         sampled_token = samples[best_idx]
 
         return sampled_token, sampler_state
+    
+
+def _hicks_rotation(logits: mx.array, entropy, varentropy, attnentropy, attnvarentropy, magnitude=False, k=1.4):
+
+    tau = mx.sin(entropy ** varentropy) * mx.cos(attnentropy ** attnvarentropy)
+    tau = mx.clip(tau, -0.6, 10)
+
+    complex_tau = 1j * tau
+    
+    angle = mx.exp(mx.pi/2 * k * complex_tau)
+    # Perform the rotation
+    rotated_logits = logits * angle
+
+    if magnitude:
+        return mx.abs(rotated_logits), tau
+    else:
+        return mx.real(rotated_logits), tau
+
+
+def hicks_sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.array, cfg: SamplerConfig, entropix_cfg: EntropixConfig,
+           clarifying_question_token: int = 2564, rng_key=None) -> Tuple[mx.array, SamplerState]:
+    metrics = calculate_metrics(logits, attention_scores)
+    ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
+    attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
+    agreement = metrics["agreement"]
+    interaction_strength = metrics["interaction_strength"]
+
+
+    # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
+    if entropix_cfg.state_treading and (ent > cfg.high_logits_entropy_threshold and
+          vent < cfg.low_logits_varentropy_threshold and
+          attn_ent < cfg.low_attention_entropy_threshold and
+          attn_vent < cfg.low_attention_varentropy_threshold and
+          (not entropix_cfg.state_extras_agreement or agreement < cfg.low_agreement_threshold) and
+          (not entropix_cfg.state_extras_interaction_strength or interaction_strength < cfg.low_interaction_strength_threshold)):
+        
+        # Insert a clarifying question token if not already present
+
+        if not mx.any(mx.equal(gen_tokens[:, -1], mx.array([clarifying_question_token]))):
+            sampler_state = SamplerState.TREADING
+            sampled_token = mx.array([[clarifying_question_token]], dtype=mx.int32)
+            return sampled_token, sampler_state, mx.array(0)
+        else:
+            sampler_state = SamplerState.EXPLORING
+            logits, angle = _hicks_rotation(logits, ent, vent, attn_ent, attn_vent, magnitude=True)
+            sampled_token = adaptive_sample(logits, temperature=1, rng_key=rng_key)
+            return sampled_token, sampler_state, angle
+
+    else:
+        sampler_state = SamplerState.ADAPTIVE
+        logits, angle = _hicks_rotation(logits, ent, vent, attn_ent, attn_vent, magnitude=False)
+        sampled_token = adaptive_sample(logits, temperature=1, rng_key=rng_key)
+
+    return sampled_token, sampler_state, angle
     

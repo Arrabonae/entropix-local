@@ -34,7 +34,7 @@ from entropix.local.config import EntropixConfig, SamplerConfig, SamplerState, G
 from entropix.local.mlx.utils import precompute_freqs_cis, build_attn_mask, validate_csv
 from entropix.local.mlx.kvcache import KVCache
 from entropix.local.mlx.model import xfmr
-from entropix.local.mlx.sampler import sample
+from entropix.local.mlx.sampler import sample, hicks_sample
 from entropix.local.mlx.metrics import calculate_metrics
 
 
@@ -302,7 +302,8 @@ class EntropixModel:
             'logits_entropy': [],
             'logits_varentropy': [],
             'attention_entropy': [],
-            'attention_varentropy': []
+            'attention_varentropy': [],
+            'angle': []
         }
         sampler_states = []
         generated_tokens = []
@@ -317,12 +318,14 @@ class EntropixModel:
         kvcache = KVCache.new(self.model_params.n_layers, bsz, self.model_params.max_seq_len, self.model_params.n_local_kv_heads, self.model_params.head_dim)
 
         logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-        next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+        #next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+        next_token, sampler_state, angle = hicks_sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
 
         metrics = calculate_metrics(logits, scores)
         for key in metrics_data.keys():
             if key in metrics:
                 metrics_data[key].append(metrics[key].item())
+        metrics_data['angle'].append(angle.item())
         sampler_states.append(sampler_state)
 
         gen_tokens = next_token
@@ -334,7 +337,8 @@ class EntropixModel:
         while cur_pos < max_tokens:
             cur_pos += 1
             logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+            #next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+            next_token, sampler_state, angle = hicks_sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
 
             metrics = calculate_metrics(logits, scores)
             for key in metrics_data.keys():
@@ -343,6 +347,7 @@ class EntropixModel:
             sampler_states.append(sampler_state)
             metrics_data['attention_entropy'].append(metrics['attn_entropy'].item())
             metrics_data['attention_varentropy'].append(metrics['attn_varentropy'].item())
+            metrics_data['angle'].append(angle.item())
             generated_tokens.append(next_token.item())
 
             gen_tokens = mx.concatenate((gen_tokens, next_token), axis=1)
@@ -352,7 +357,7 @@ class EntropixModel:
 
         if debug:
             #self.debug_visualize_metrics(metrics_data)
-            self.visualize_sampler_metrics(metrics_data['logits_entropy'], metrics_data['logits_varentropy'], sampler_states, generated_tokens)
+            self.visualize_sampler_metrics(metrics_data['logits_entropy'], metrics_data['logits_varentropy'], sampler_states, generated_tokens, metrics_data['angle'])
             fig = self.visualize_token_entropy_varentropy(metrics_data, generated_tokens)
             if not batch:
                 fig.show()
@@ -391,7 +396,7 @@ class EntropixModel:
         plt.tight_layout()
         #plt.show()
 
-    def visualize_sampler_metrics(self, entropies, varentropies, sampler_states, generated_tokens):
+    def visualize_sampler_metrics(self, entropies, varentropies, sampler_states, generated_tokens, angle):
         # Create a plotly figure with subplots
         fig = go.Figure()
         
@@ -412,8 +417,24 @@ class EntropixModel:
             "Step: %{x}<br>" +
             "Value: %{y}<br>" +
             "Token: %{customdata[0]}<br>" +
-            "State: %{customdata[1]}"
+            "State: %{customdata[1]}<br>"
+            "hicks angle: %{customdata[2]:.2f}"
         )
+
+        # Add angle bars
+        fig.add_trace(go.Bar(
+        x=list(range(len(angle))),
+        y=angle,
+        name='hicks rotational angle',
+        marker_color='rgba(70, 130, 180, 0.6)',  # steelblue
+        yaxis='y3',
+        customdata=list(zip(
+            token_texts if token_texts else [''] * len(angle),
+            [state.value for state in sampler_states],
+            angle
+        )),
+        hovertemplate=hover_template
+    ))
         
         # Add entropy trace
         fig.add_trace(go.Scatter(
@@ -424,7 +445,8 @@ class EntropixModel:
             yaxis='y1',
             customdata=list(zip(
                 token_texts if token_texts else [''] * len(entropies),
-                [state.value for state in sampler_states]
+                [state.value for state in sampler_states],
+                angle
             )),
             hovertemplate=hover_template
         ))
@@ -438,7 +460,8 @@ class EntropixModel:
             yaxis='y1',
             customdata=list(zip(
                 token_texts if token_texts else [''] * len(varentropies),
-                [state.value for state in sampler_states]
+                [state.value for state in sampler_states],
+                angle
             )),
             hovertemplate=hover_template
         ))
@@ -499,6 +522,11 @@ class EntropixModel:
                 showticklabels=False,
                 range=[-0.5, 0.5]
             ),
+            yaxis3=dict( 
+                title='hicks rotational angle',
+                overlaying='y',
+                side='right'
+            ),
             height=750,
             showlegend=True,
             legend=dict(
@@ -513,7 +541,20 @@ class EntropixModel:
         # Add tokens
         formatted_text = ""
         line_length = 0
-        max_line_length = 180 #some longer prompt overflow for some reason, keep it 270 for now
+        num_tokens = len(token_texts)
+        # Adaptive parameters based on number of tokens
+        if num_tokens > 500:
+            font_size = 10  # Smaller font for many tokens
+            max_line_length = 320  # More tokens per line
+            y_position = 0.01  # Lower position to allow more rows
+        elif num_tokens > 300:
+            font_size = 11
+            max_line_length = 280
+            y_position = 0.06
+        else:
+            font_size = 12
+            max_line_length = 250
+            y_position = 0.07
         
         for token, state in zip(token_texts, sampler_states):
             color = colors[state]
@@ -526,7 +567,10 @@ class EntropixModel:
             
             formatted_text += token_text
             line_length += len(token) + 1  # +1 for the space
-        
+
+        # Calculate number of lines for dynamic bottom margin
+        num_lines = formatted_text.count('<br>') + 1
+        bottom_margin = max(30, num_lines * (font_size * 0.8))  # Scale margin with font size
         
         # Add the text
         fig.add_annotation(
@@ -534,25 +578,23 @@ class EntropixModel:
             xref="paper",
             yref="paper",
             x=0,
-            y=0.07,  
+            y=y_position,
             showarrow=False,
-            font=dict(size=20),
+            font=dict(size=font_size),
             align="left",
             xanchor="left",
             yanchor="top",
             xshift=5,
-            yshift=0, 
+            yshift=0,
             bordercolor="gray",
-            borderwidth=0,  
+            borderwidth=0,
         )
         
-        num_lines = formatted_text.count('<br>') + 1
-        bottom_margin = max(30, num_lines * 15)  
-        
+        # Update layout with dynamic margins
         fig.update_layout(
             margin=dict(b=bottom_margin),
-            yaxis=dict(domain=[0.25, 0.95]),  
-            yaxis2=dict(domain=[0.1, 0.2])   
+            yaxis=dict(domain=[0.25, 0.95]),
+            yaxis2=dict(domain=[0.1, 0.2])
         )
         
         # Generate timestamp and save
@@ -579,7 +621,8 @@ class EntropixModel:
             'logits_entropy': [],
             'logits_varentropy': [],
             'attention_entropy': [],
-            'attention_varentropy': []
+            'attention_varentropy': [],
+            'angle': []
         }
         sampler_states = []
         generated_tokens = []
@@ -597,13 +640,15 @@ class EntropixModel:
 
         # Generate first token
         logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-        next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+        #next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+        next_token, sampler_state, angle = hicks_sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
 
         # Track metrics
         metrics = calculate_metrics(logits, scores)
         for key in metrics_data.keys():
             if key in metrics:
                 metrics_data[key].append(metrics[key].item())
+        metrics_data['angle'].append(angle.item())
         sampler_states.append(sampler_state)
         generated_tokens.append(next_token.item())
 
@@ -619,8 +664,8 @@ class EntropixModel:
         while cur_pos < max_tokens:
             cur_pos += 1
             logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
-
+            #next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+            next_token, sampler_state, angle = hicks_sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
             # Track metrics
             metrics = calculate_metrics(logits, scores)
             for key in metrics_data.keys():
@@ -629,6 +674,7 @@ class EntropixModel:
             sampler_states.append(sampler_state)
             metrics_data['attention_entropy'].append(metrics['attn_entropy'].item())
             metrics_data['attention_varentropy'].append(metrics['attn_varentropy'].item())
+            metrics_data['angle'].append(angle.item())
             generated_tokens.append(next_token.item())
 
             # Update state and yield token
@@ -640,7 +686,7 @@ class EntropixModel:
                 break
 
         if debug and len(generated_tokens) > 0:  # Only show visualizations if we have data
-            self.visualize_sampler_metrics(metrics_data['logits_entropy'], metrics_data['logits_varentropy'], sampler_states, generated_tokens)
+            self.visualize_sampler_metrics(metrics_data['logits_entropy'], metrics_data['logits_varentropy'], sampler_states, generated_tokens, metrics_data['angle'])
             fig = self.visualize_token_entropy_varentropy(metrics_data, generated_tokens)
             # if not batch:
             #     fig.show()
