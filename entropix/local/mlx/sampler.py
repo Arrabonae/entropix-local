@@ -1,10 +1,10 @@
 import mlx.core as mx
 from typing import Tuple, Dict
 
-#global inports
+#global imports
 from entropix.local.config import SamplerState, SamplerConfig, EntropixConfig
 
-#framework specific improts
+#framework specific imports
 from entropix.local.mlx.metrics import calculate_metrics
 
 def multinomial_sample_one(probs_sort: mx.array, rng_key) -> mx.array:
@@ -106,9 +106,9 @@ def adaptive_sample(logits: mx.array, temperature: float, epsilon: float = 0.01,
 
     return next_token.astype(mx.int32)
 
-def sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.array, cfg: SamplerConfig, entropix_cfg: EntropixConfig,
+def sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.array, cfg: SamplerConfig, entropix_cfg: EntropixConfig, cur_pos: int,
            clarifying_question_token: int = 2564, rng_key=None) -> Tuple[mx.array, SamplerState]:
-    metrics = calculate_metrics(logits, attention_scores)
+    metrics = calculate_metrics(logits, attention_scores, cur_pos)
     ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
     attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
     agreement = metrics["agreement"]
@@ -285,8 +285,8 @@ def sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.array, c
 
 def _hicks_rotation(logits: mx.array, entropy, varentropy, attnentropy, attnvarentropy, magnitude=False, k=1.4):
 
-    tau = mx.sin(entropy ** varentropy) * mx.cos(attnentropy ** attnvarentropy)
-    tau = mx.clip(tau, -0.6, 10)
+    tau = mx.sin(entropy * varentropy) * mx.cos(attnentropy * attnvarentropy)
+    tau = mx.clip(tau, -0.7, 0.7)
 
     complex_tau = 1j * tau
     
@@ -300,9 +300,9 @@ def _hicks_rotation(logits: mx.array, entropy, varentropy, attnentropy, attnvare
         return mx.real(rotated_logits), tau
 
 
-def hicks_sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.array, cfg: SamplerConfig, entropix_cfg: EntropixConfig,
+def hicks_sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.array, cfg: SamplerConfig, entropix_cfg: EntropixConfig, cur_pos: int, 
            clarifying_question_token: int = 2564, rng_key=None) -> Tuple[mx.array, SamplerState]:
-    metrics = calculate_metrics(logits, attention_scores)
+    metrics = calculate_metrics(logits, attention_scores, cur_pos)
     ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
     attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
     agreement = metrics["agreement"]
@@ -322,17 +322,17 @@ def hicks_sample(gen_tokens: mx.array, logits: mx.array, attention_scores: mx.ar
         if not mx.any(mx.equal(gen_tokens[:, -1], mx.array([clarifying_question_token]))):
             sampler_state = SamplerState.TREADING
             sampled_token = mx.array([[clarifying_question_token]], dtype=mx.int32)
-            return sampled_token, sampler_state, mx.array(0)
+            return sampled_token, sampler_state, mx.array(0), logits
         else:
             sampler_state = SamplerState.EXPLORING
             logits, angle = _hicks_rotation(logits, ent, vent, attn_ent, attn_vent, magnitude=True)
             sampled_token = adaptive_sample(logits, temperature=1, rng_key=rng_key)
-            return sampled_token, sampler_state, angle
+            return sampled_token, sampler_state, angle, logits
 
     else:
         sampler_state = SamplerState.ADAPTIVE
         logits, angle = _hicks_rotation(logits, ent, vent, attn_ent, attn_vent, magnitude=False)
         sampled_token = adaptive_sample(logits, temperature=1, rng_key=rng_key)
 
-    return sampled_token, sampler_state, angle
+    return sampled_token, sampler_state, angle, logits
     

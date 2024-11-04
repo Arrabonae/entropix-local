@@ -318,10 +318,10 @@ class EntropixModel:
         kvcache = KVCache.new(self.model_params.n_layers, bsz, self.model_params.max_seq_len, self.model_params.n_local_kv_heads, self.model_params.head_dim)
 
         logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-        #next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
-        next_token, sampler_state, angle = hicks_sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+        #next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config, seqlen, rng_key=self.rng_key)
+        next_token, sampler_state, angle, logits = hicks_sample(tokens, logits, scores, self.sampler_config, self.entropix_config, seqlen, rng_key=self.rng_key)
 
-        metrics = calculate_metrics(logits, scores)
+        metrics = calculate_metrics(logits, scores, seqlen)
         for key in metrics_data.keys():
             if key in metrics:
                 metrics_data[key].append(metrics[key].item())
@@ -337,10 +337,10 @@ class EntropixModel:
         while cur_pos < max_tokens:
             cur_pos += 1
             logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            #next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
-            next_token, sampler_state, angle = hicks_sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+            #next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config,cur_pos, rng_key=self.rng_key)
+            next_token, sampler_state, angle, logits = hicks_sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, cur_pos, rng_key=self.rng_key)
 
-            metrics = calculate_metrics(logits, scores)
+            metrics = calculate_metrics(logits, scores, cur_pos)
             for key in metrics_data.keys():
                 if key in metrics:
                     metrics_data[key].append(metrics[key].item())
@@ -405,11 +405,11 @@ class EntropixModel:
         
         # Define colors for sampler states
         colors = {
-            SamplerState.FLOWING: 'lightblue',
-            SamplerState.TREADING: 'lightgreen',
-            SamplerState.EXPLORING: 'orange',
-            SamplerState.RESAMPLING: 'pink',
-            SamplerState.ADAPTIVE: 'purple'
+            SamplerState.FLOWING: {'bg': '#ADD8E6', 'text': '#000000'},      # light blue
+            SamplerState.TREADING: {'bg': '#90EE90', 'text': '#000000'},     # light green
+            SamplerState.EXPLORING: {'bg': '#FF8C00', 'text': '#000000'},    # dark orange
+            SamplerState.RESAMPLING: {'bg': '#FF69B4', 'text': '#000000'},   # hot pink
+            SamplerState.ADAPTIVE: {'bg': '#800080', 'text': '#FFFFFF'}      # purple
         }
         
         # Create unified hover text
@@ -467,7 +467,7 @@ class EntropixModel:
         ))
         
         # Create state indicators
-        state_colors = [colors[state] for state in sampler_states]
+        state_colors = [colors[state]['bg'] for state in sampler_states]
         state_names = [state.value for state in sampler_states]
         
         # Add state indicators
@@ -496,7 +496,7 @@ class EntropixModel:
                 y=[None],
                 mode='markers',
                 marker=dict(
-                    color=color,
+                    color=color['bg'],
                     size=10,
                     symbol='square',
                 ),
@@ -538,69 +538,62 @@ class EntropixModel:
             )
         )
         
-        # Add tokens
-        formatted_text = ""
-        line_length = 0
-        num_tokens = len(token_texts)
-        # Adaptive parameters based on number of tokens
-        if num_tokens > 500:
-            font_size = 10  # Smaller font for many tokens
-            max_line_length = 320  # More tokens per line
-            y_position = 0.01  # Lower position to allow more rows
-        elif num_tokens > 300:
-            font_size = 11
-            max_line_length = 280
-            y_position = 0.06
-        else:
-            font_size = 12
-            max_line_length = 250
-            y_position = 0.07
-        
-        for token, state in zip(token_texts, sampler_states):
-            color = colors[state]
-            token_text = f"<span style='color: {color}'>{token}</span> "
-            
-            # Add newline if current line would be too long
-            if line_length + len(token) > max_line_length:
-                formatted_text += "<br>"
-                line_length = 0
-            
-            formatted_text += token_text
-            line_length += len(token) + 1  # +1 for the space
-
-        # Calculate number of lines for dynamic bottom margin
-        num_lines = formatted_text.count('<br>') + 1
-        bottom_margin = max(30, num_lines * (font_size * 0.8))  # Scale margin with font size
-        
-        # Add the text
-        fig.add_annotation(
-            text=formatted_text,
-            xref="paper",
-            yref="paper",
-            x=0,
-            y=y_position,
-            showarrow=False,
-            font=dict(size=font_size),
-            align="left",
-            xanchor="left",
-            yanchor="top",
-            xshift=5,
-            yshift=0,
-            bordercolor="gray",
-            borderwidth=0,
-        )
-        
-        # Update layout with dynamic margins
-        fig.update_layout(
-            margin=dict(b=bottom_margin),
-            yaxis=dict(domain=[0.25, 0.95]),
-            yaxis2=dict(domain=[0.1, 0.2])
-        )
         
         # Generate timestamp and save
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"entropix/results/sampler_metrics_{timestamp}.html"
-        fig.write_html(filename, include_plotlyjs=True, full_html=True)
+
+            # Create HTML content with the figure and text below
+        html_content = f"""
+        <html>
+        <head>
+            <style>
+                .container {{
+                    display: flex;
+                    flex-direction: column;
+                    width: 100%;
+                    max-width: 1200px;
+                    margin: 0 auto;
+                }}
+                .plot-container {{
+                    width: 100%;
+                }}
+                .text-container {{
+                    margin-top: 20px;
+                    padding: 20px;
+                    border-top: 1px solid #ccc;
+                    max-height: 400px;
+                    overflow-y: auto;
+                    font-family: monospace;
+                    white-space: pre-wrap;
+                    word-wrap: break-word;
+                }}
+                .token {{
+                    display: inline-block;
+                    padding: 2px 4px;
+                    margin: 2px;
+                    border-radius: 3px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="plot-container">
+                    {fig.to_html(full_html=False, include_plotlyjs='cdn')}
+                </div>
+                <div class="text-container">
+                    <h3>Generated Tokens:</h3>
+                    {''.join([f'<span class="token" style="background-color: {colors[state]["bg"]}; color: {colors[state]["text"]};">{token}</span>' 
+                            for token, state in zip(token_texts, sampler_states)])}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        # Write the complete HTML file
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
         print(f"Sampler metrics visualization saved to {filename}")
         
         return fig
@@ -640,11 +633,11 @@ class EntropixModel:
 
         # Generate first token
         logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-        #next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
-        next_token, sampler_state, angle = hicks_sample(tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+        #next_token, sampler_state = sample(tokens, logits, scores, self.sampler_config, self.entropix_config,seqlen, rng_key=self.rng_key)
+        next_token, sampler_state, angle, logits = hicks_sample(tokens, logits, scores, self.sampler_config, self.entropix_config, seqlen, rng_key=self.rng_key)
 
         # Track metrics
-        metrics = calculate_metrics(logits, scores)
+        metrics = calculate_metrics(logits, scores, seqlen)
         for key in metrics_data.keys():
             if key in metrics:
                 metrics_data[key].append(metrics[key].item())
@@ -664,10 +657,10 @@ class EntropixModel:
         while cur_pos < max_tokens:
             cur_pos += 1
             logits, kvcache, scores, _ = xfmr(self.xfmr_weights, self.model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            #next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
-            next_token, sampler_state, angle = hicks_sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config, rng_key=self.rng_key)
+            #next_token, sampler_state = sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config,cur_pos, rng_key=self.rng_key)
+            next_token, sampler_state, angle, logits = hicks_sample(gen_tokens, logits, scores, self.sampler_config, self.entropix_config,cur_pos, rng_key=self.rng_key)
             # Track metrics
-            metrics = calculate_metrics(logits, scores)
+            metrics = calculate_metrics(logits, scores, cur_pos)
             for key in metrics_data.keys():
                 if key in metrics:
                     metrics_data[key].append(metrics[key].item())
