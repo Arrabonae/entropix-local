@@ -506,7 +506,13 @@ class EntropixModel:
         
         # Update layout
         fig.update_layout(
-            title='Entropy, Varentropy and Sampler States over Generation Steps',
+            title=dict(
+                text='Entropy, Varentropy and Sampler States over Generation Steps',
+                y=0.95,  # Move title down slightly
+                x=0.5,
+                xanchor='center',
+                yanchor='top'
+            ),
             xaxis=dict(
                 title='Generation Step',
                 showticklabels=True,
@@ -530,12 +536,13 @@ class EntropixModel:
             height=750,
             showlegend=True,
             legend=dict(
-                yanchor="bottom",
-                y=1.02,
+                yanchor="top",
+                y=1.0, 
                 xanchor="right",
                 x=1,
                 orientation="h"
-            )
+            ),
+            margin=dict(t=100)
         )
         
         
